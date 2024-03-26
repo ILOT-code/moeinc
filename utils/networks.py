@@ -14,8 +14,29 @@ def get_nnmodule_param_count(module: nn.Module):
         param_count += int(np.prod(param.shape))
     return param_count
 
+def calc_mlp_param_count(input_size, hidden_size, output_size, layers):
+    param_count = (
+        input_size * hidden_size
+        + hidden_size
+        + (layers - 2) * (hidden_size**2 + hidden_size)
+        + hidden_size * output_size
+        + output_size
+    )
+    return int(param_count)
+
+def calc_mlp_features(param_count, input_size, output_size, layers):
+    a = layers - 2
+    b = input_size + 1 + layers - 2 + output_size
+    c = -param_count + output_size
+
+    if a == 0:
+        hidden_size = round(-c / b)
+    else:
+        hidden_size = round((-b + math.sqrt(b**2 - 4 * a * c)) / (2 * a))
+    return hidden_size
 
 def sine_init(m):
+    # print(m)
     with torch.no_grad():
         if hasattr(m, "weight"):
             num_input = m.weight.size(-1)
@@ -67,29 +88,6 @@ class SIREN(nn.Module):
         output = self.net(coords)
         return output
 
-    @staticmethod
-    def calc_param_count(coords_channel, data_channel, features, layers, **kwargs):
-        param_count = (
-            coords_channel * features
-            + features
-            + (layers - 2) * (features**2 + features)
-            + features * data_channel
-            + data_channel
-        )
-        return int(param_count)
-
-    @staticmethod
-    def calc_features(param_count, coords_channel, data_channel, layers, **kwargs):
-        a = layers - 2
-        b = coords_channel + 1 + layers - 2 + data_channel
-        c = -param_count + data_channel
-
-        if a == 0:
-            features = round(-c / b)
-        else:
-            features = round((-b + math.sqrt(b**2 - 4 * a * c)) / (2 * a))
-        return features
-
 
 class PosEncodingNeRF(nn.Module):
     def __init__(self, in_channel, frequencies=10):
@@ -121,8 +119,41 @@ class Moe(nn.Module):
         self.net.append(nn.Sequential(nn.Linear(input_size, hidden_size), nn.ReLU()))
         for i in range(layers - 2):
             self.net.append(nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.ReLU()))
-        self.net.append(nn.Sequential(nn.Linear(hidden_size, output_size), nn.Softmax(dim=1)))
+        self.net.append(nn.Sequential(nn.Linear(hidden_size, output_size), nn.Softmax(dim=-1)))
         self.net = nn.Sequential(*self.net)
+        # 初始化暂时按照sine_init
+        self.net.apply(sine_init)
+        # print(self.net)
 
     def forward(self, x):
         return self.net(x)
+    
+class CombinedNetwork(nn.Module):
+    def __init__(self, num_sirens, input_size, frequencies, hidden_size, output_size, layersiren, layersmoe):
+        super().__init__()
+
+        self.pos_enc = PosEncodingNeRF(input_size, frequencies)
+        input_size = self.pos_enc.out_channel
+        self.sirens = nn.ModuleList([SIREN(input_size,hidden_size,hidden_size,layersiren) for _ in range(num_sirens)])
+        self.moe = Moe(input_size, hidden_size, num_sirens, layersmoe)
+        self.mlp = nn.Sequential(nn.Linear(num_sirens*hidden_size, hidden_size), nn.ReLU(), nn.Linear(hidden_size, output_size))
+        self.mlp.apply(sine_init)
+        
+
+    def forward(self, x):
+        x = self.pos_enc(x)
+        siren_outputs = [siren(x) for siren in self.sirens]
+        weights = self.moe(x).repeat_interleave(siren_outputs[0].shape[-1], dim=-1)
+        siren_outputs = torch.cat(siren_outputs, dim=-1)
+        weight_output = weights * siren_outputs
+        return self.mlp(weight_output)
+    
+
+# mynet = CombinedNetwork(3, 3, 10, 256, 1, 5, 5)
+# print(mynet.parameters)
+# x = torch.rand(100,50,3)
+# y = mynet(x)
+# print(y.shape)
+
+# print(get_nnmodule_param_count(mynet))
+# print(calc_mlp_param_count(63,256,3,5)+3*calc_mlp_param_count(63,256,256,5)+calc_mlp_param_count(256*3,256,1,2))

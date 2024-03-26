@@ -46,3 +46,14 @@ def get_folder_size(folder_path: str):
     else:
         total_size = os.path.getsize(folder_path)
     return total_size
+
+
+def generate_3d_data(shape: List[int], data_range: Union[int, float] = 1, seed: int = 1):
+    np.random.seed(seed)
+    data = np.random.rand(*shape) * data_range
+    return data
+
+data1 = generate_3d_data([512, 512, 200], 255, seed = 1)
+data2 = generate_3d_data([512, 512, 200], 255, seed = 100)
+print(calc_psnr(data1, data2))
+print(calc_ssim(data1, data2))
