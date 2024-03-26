@@ -147,8 +147,47 @@ class CombinedNetwork(nn.Module):
         siren_outputs = torch.cat(siren_outputs, dim=-1)
         weight_output = weights * siren_outputs
         return self.mlp(weight_output)
-    
 
+
+def l2_loss(gt, predicted, weight_map) -> torch.Tensor:
+    loss = F.mse_loss(gt, predicted, reduction="none")
+    loss = loss * weight_map
+    loss = loss.mean()
+    return loss
+
+
+def configure_optimizer(parameters, optimizer_opt) -> torch.optim.Optimizer:
+    optimizer_opt = deepcopy(optimizer_opt)
+    optimizer_name = optimizer_opt.pop("name")
+    if optimizer_name == "Adam":
+        Optimizer = torch.optim.Adam(parameters, **optimizer_opt)
+    elif optimizer_name == "Adamax":
+        Optimizer = torch.optim.Adamax(parameters, **optimizer_opt)
+    elif optimizer_name == "SGD":
+        Optimizer = torch.optim.SGD(parameters, **optimizer_opt)
+    else:
+        raise NotImplementedError
+    return Optimizer
+
+
+def configure_lr_scheduler(optimizer, lr_scheduler_opt):
+    lr_scheduler_opt = deepcopy(lr_scheduler_opt)
+    lr_scheduler_name = lr_scheduler_opt.pop("name")
+    if lr_scheduler_name == "MultiStepLR":
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, **lr_scheduler_opt
+        )
+    elif lr_scheduler_name == "CyclicLR":
+        lr_scheduler = torch.optim.lr_scheduler.CyclicLR(optimizer, **lr_scheduler_opt)
+    elif lr_scheduler_name == "StepLR":
+        lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, **lr_scheduler_opt)
+    elif lr_scheduler_name == "None":
+        lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=[100000000000]
+        )
+    else:
+        raise NotImplementedError
+    return lr_scheduler
 # mynet = CombinedNetwork(3, 3, 10, 256, 1, 5, 5)
 # print(mynet.parameters)
 # x = torch.rand(100,50,3)
