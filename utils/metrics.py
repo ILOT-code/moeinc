@@ -4,6 +4,27 @@ from einops import rearrange
 from skimage.metrics import structural_similarity
 import numpy as np
 
+def parse_checkpoints(checkpoints: Union[str, int], max_steps: int) -> List[int]:
+    if checkpoints == "none":
+        checkpoints = [max_steps]
+    elif "every" in checkpoints:
+        # e.g. every_10000
+        _, interval = checkpoints.split("_")
+        interval = int(interval)
+        checkpoints = list(range(interval, max_steps, interval))
+        checkpoints.append(max_steps)
+    elif isinstance(checkpoints, int):
+        # e.g. 40000
+        if checkpoints >= max_steps:
+            checkpoints = [max_steps]
+        else:
+            checkpoints = [checkpoints, max_steps]
+    else:
+        # e.g. [40000,50000,60000]
+        checkpoints = [int(s) for s in checkpoints.split(",") if int(s) < max_steps]
+        checkpoints.append(max_steps)
+    return checkpoints
+
 def get_type_max(data):
     dtype = data.dtype.name
     if dtype == "uint8":
@@ -53,7 +74,7 @@ def generate_3d_data(shape: List[int], data_range: Union[int, float] = 1, seed: 
     data = np.random.rand(*shape) * data_range
     return data
 
-data1 = generate_3d_data([512, 512, 200], 255, seed = 1)
-data2 = generate_3d_data([512, 512, 200], 255, seed = 100)
-print(calc_psnr(data1, data2))
-print(calc_ssim(data1, data2))
+# data1 = generate_3d_data([512, 512, 200], 255, seed = 1)
+# data2 = generate_3d_data([512, 512, 200], 255, seed = 100)
+# print(calc_psnr(data1, data2))
+# print(calc_ssim(data1, data2))

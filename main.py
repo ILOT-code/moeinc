@@ -17,18 +17,24 @@ import tifffile
 import torch
 from torch.utils.tensorboard import SummaryWriter
 from utils import *
-from utils.metrics import calc_psnr, calc_ssim, get_folder_size, parse_checkpoints
+from utils.metrics import (
+    calc_psnr, 
+    calc_ssim, 
+    get_folder_size, 
+    parse_checkpoints,
+)
 
 from utils.networks import (
     SIREN,
+    Moeincnet,
     configure_lr_scheduler,
     configure_optimizer,
     get_nnmodule_param_count,
     calc_mlp_param_count,
     calc_mlp_features,
     l2_loss,
-    load_model,
-    save_model,
+    # load_model,
+    # save_model,
 )
 from utils.samplers import RandomPointSampler3D
 
@@ -54,11 +60,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "-c",
         type=str,
-        default=opj(opd(__file__), "config", "SingleExp", "sci.yaml"),
+        default=opj(opd(__file__), "config", "test.yaml"),
         help="yaml file path",
     )
     parser.add_argument("-g", type=str, default="0", help="gpu index")
     args = parser.parse_args()
+
     config_path = os.path.abspath(args.c)
     # Make the gpu index used by CUDA_VISIBLE_DEVICES consistent with the gpu index shown in nvidia-smi
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
@@ -114,21 +121,13 @@ if __name__ == "__main__":
     # calculate network structure
     ideal_network_size_bytes = os.path.getsize(data_path) / config.compression_ratio
     ideal_network_parameters_count = ideal_network_size_bytes / 4.0
-    n_network_features = SIREN.calc_features(
-        param_count=ideal_network_parameters_count, **config.network_structure
-    )
-    actual_network_parameters_count = SIREN.calc_param_count(
-        features=n_network_features, **config.network_structure
-    )
-    actual_network_size_bytes = actual_network_parameters_count * 4.0
-    # initialize network
-    network = SIREN(features=n_network_features, **config.network_structure)
-    assert (
-        get_nnmodule_param_count(network) == actual_network_parameters_count
-    ), "The calculated network structure mismatch the actual_network_parameters_count!"
+
+    network = Moeincnet(ideal_network_parameters_count, **config.network_structure)
+    actual_network_size_bytes = network.actual_param_count * 4.0
+
     # (optional) load pretrained network
-    if config.pretrained_network_path is not None:
-        load_model(network, config.pretrained_network_path, "cuda")
+    # if config.pretrained_network_path is not None:
+    #     load_model(network, config.pretrained_network_path, "cuda")
     # move network to device
     network.cuda()
     ###########################
@@ -221,7 +220,7 @@ if __name__ == "__main__":
             )
             sideinfos_save_path = opj(compressed_data_save_dir, "sideinfos.yaml")
             OmegaConf.save(sideinfos.__dict__, sideinfos_save_path)
-            save_model(network, network_parameters_save_dir, "cuda")
+            # save_model(network, network_parameters_save_dir, "cuda")
             # decompress data
             with torch.no_grad():
                 flattened_coords = rearrange(coordinates, "d h w c-> (d h w) c")
@@ -274,9 +273,10 @@ if __name__ == "__main__":
             results["data_name"] = data_name
             results["data_type"] = config.data.get("type")
             results["data_shape"] = data_shape
-            results["actual_ratio"] = os.path.getsize(data_path) / get_folder_size(
-                network_parameters_save_dir
-            )
+            # results["actual_ratio"] = os.path.getsize(data_path) / get_folder_size(
+            #     network_parameters_save_dir
+            # )
+            results["actual_ratio"] = os.path.getsize(data_path)/network.actual_param_count
             results["psnr"] = psnr
             results["ssim"] = ssim
             results["compression_time_seconds"] = compression_time_seconds
