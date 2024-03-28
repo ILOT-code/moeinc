@@ -1,8 +1,0 @@
-dtype: uint16
-depth: 64
-height: 64
-width: 64
-original_min: 16633.0
-original_max: 24070.0
-normalized_min: 0
-normalized_max: 100
