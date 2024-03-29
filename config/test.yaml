@@ -17,9 +17,9 @@ data:
   weight_map_rules: ~
 compression_ratio: 256
 network_structure:
-  moe_ratio: 0.3
-  num_sirens: 3
-  input_size: 3
+  moe_ratio: 0.2
+  num_sirens: 2
+  input_size: 16
   frequencies: 20
   output_size: 1
   layersiren: 5

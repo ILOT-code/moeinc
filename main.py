@@ -36,7 +36,7 @@ from utils.networks import (
     # load_model,
     # save_model,
 )
-from utils.samplers import RandomPointSampler3D
+from utils.samplers import RandomPointSampler3D, RandomPointSampler3D_context
 
 
 EXPERIMENTAL_CONDITIONS = ["data_name", "data_type", "data_shape", "actual_ratio"]
@@ -169,13 +169,19 @@ if __name__ == "__main__":
             )
         )
     if sampling_required:
-        sampler = RandomPointSampler3D(
-            coordinates, normalized_data, weight_map, n_random_training_samples
+        sampler = RandomPointSampler3D_context(
+            coordinates, normalized_data, weight_map, n_random_training_samples,3
         )
     else:
-        coords_batch = rearrange(coordinates, "d h w c-> (d h w) c")
-        gt_batch = rearrange(normalized_data, "d h w c-> (d h w) c")
-        weight_map_batch = rearrange(weight_map, "d h w c-> (d h w) c")
+        sampler = RandomPointSampler3D_context(
+            coordinates, normalized_data, weight_map, 100,3
+        )
+        coords_batch = sampler.flattened_coordinates
+        gt_batch = sampler.flattened_data
+        weight_map_batch = sampler.flattened_weight_map
+        # coords_batch = rearrange(coordinates, "d h w c-> (d h w) c")
+        # gt_batch = rearrange(normalized_data, "d h w c-> (d h w) c")
+        # weight_map_batch = rearrange(weight_map, "d h w c-> (d h w) c")
     if sampling_required:
         print(f"Use mini-batch training with batch-size={n_random_training_samples}")
     else:
@@ -193,7 +199,15 @@ if __name__ == "__main__":
             coords_batch, gt_batch, weight_map_batch = sampler.next()
         optimizer.zero_grad()
         predicted_batch = network(coords_batch)
-        loss = l2_loss(predicted_batch, gt_batch, weight_map_batch)
+        loss_d = l2_loss(predicted_batch, gt_batch, weight_map_batch)
+
+        loss_d_detach = loss_d.detach()
+        loss_r_detach = network.kl_loss.detach()
+        labmda = torch.tensor(2, device="cuda")
+        if loss_r_detach * labmda > 0.25* loss_d_detach:
+            labmda = 0.25*loss_d_detach / loss_r_detach
+        loss_r = labmda * network.kl_loss
+        loss = loss_d + loss_r
         loss.backward()
         optimizer.step()
         lr_scheduler.step()
@@ -202,7 +216,8 @@ if __name__ == "__main__":
             compression_time_seconds += compression_time_end - compression_time_start
             # pbar.set_postfix_str("loss={:.6f}".format(loss.item()))
             print(
-                f"#Steps:{steps} Loss:{loss.item()} ElapsedTime:{compression_time_seconds}s",
+                f"#Steps:{steps} Loss:{loss.item()} ElapsedTime:{compression_time_seconds}s ra:{loss_r/loss}",
+                
                 flush=True,
             )
             tblogger.add_scalar("loss", loss.item(), steps)

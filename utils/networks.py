@@ -140,7 +140,7 @@ class Moe(nn.Module):
         self.net.append(nn.Sequential(nn.Linear(input_size, hidden_size), nn.ReLU()))
         for i in range(layers - 2):
             self.net.append(nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.ReLU()))
-        self.net.append(nn.Sequential(nn.Linear(hidden_size, output_size),Tok_k(2),nn.Softmax(dim=-1)))
+        self.net.append(nn.Sequential(nn.Linear(hidden_size, output_size),Tok_k(1),nn.Softmax(dim=-1)))
         self.net = nn.Sequential(*self.net)
         # 初始化暂时按照sine_init
         self.net.apply(sine_init)
@@ -153,12 +153,13 @@ class Moe(nn.Module):
 class Moeincnet(nn.Module):
     def __init__(self, para_count, moe_ratio, num_sirens, input_size, frequencies, output_size, layersiren, layersmoe,w0,output_act):
         super().__init__()
-        self.pos_enc = PosEncodingNeRF(input_size, frequencies)
-        input_size = self.pos_enc.out_channel
-        
+        # self.pos_enc = PosEncodingNeRF(input_size, frequencies)
+        # input_size = self.pos_enc.out_channel
         moe_para_count = int(para_count * moe_ratio)
         siren_para_count = para_count - moe_para_count
         
+        # self.encoder = nn.Sequential(nn.Linear(input_size,256),Sine(),nn.Linear(256, 30))
+        # input_size = 30
         moe_features = calc_mlp_features(moe_para_count, input_size, num_sirens, layersmoe)
         siren_features = calc_mlp_features(int(siren_para_count/num_sirens), input_size, False, layersiren)
         
@@ -170,11 +171,18 @@ class Moeincnet(nn.Module):
         
         self.actual_param_count = calc_mlp_param_count(input_size,siren_features,siren_features,layersiren)*num_sirens+calc_mlp_param_count(input_size,moe_features,num_sirens,layersmoe)
         self.all_param_count = self.actual_param_count + calc_mlp_param_count(num_sirens*siren_features,siren_features,output_size,2)
+        self.kl_loss = 0
 
     def forward(self, x):
-        x = self.pos_enc(x)
+        # x = self.encoder(x)
         siren_outputs = [siren(x) for siren in self.sirens]
-        weights = self.moe(x).repeat_interleave(siren_outputs[0].shape[-1], dim=-1)
+        weights = self.moe(x)
+        # print(weights)
+        log_weights = torch.log(weights+1e-10)
+        # print(log_weights)
+        self.kl_loss = F.kl_div(log_weights, torch.ones_like(weights)/weights.shape[-1], reduction='batchmean')
+        # print(self.kl_loss)
+        weights = weights.repeat_interleave(siren_outputs[0].shape[-1], dim=-1)
         siren_outputs = torch.cat(siren_outputs, dim=-1)
         weight_output = weights * siren_outputs
         return self.decoder(weight_output)
@@ -219,6 +227,9 @@ def configure_lr_scheduler(optimizer, lr_scheduler_opt):
     else:
         raise NotImplementedError
     return lr_scheduler
+
+
+
 # mynet = CombinedNetwork(3, 3, 10, 256, 1, 5, 5)
 # print(mynet.parameters)
 # x = torch.rand(100,50,3)
