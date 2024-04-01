@@ -8,6 +8,7 @@ import torch
 from typing import List, Union
 from torch import nn
 import torch.nn.functional as F
+from torch.nn import init
 
 def get_nnmodule_param_count(module: nn.Module):
     param_count = 0
@@ -16,6 +17,9 @@ def get_nnmodule_param_count(module: nn.Module):
     return param_count
 
 def calc_mlp_param_count(input_size, hidden_size, output_size, layers):
+    if layers == 1:
+        param_count = input_size * output_size + output_size
+        return int(param_count)
     param_count = (
         input_size * hidden_size
         + hidden_size
@@ -49,7 +53,9 @@ def sine_init(m):
             num_input = m.weight.size(-1)
             m.weight.uniform_(-np.sqrt(6 / num_input) / 30, np.sqrt(6 / num_input) / 30)
 
-
+def kaiming_init_weights(m):
+    if isinstance (m, (nn.Linear)): 
+        init.kaiming_normal_(m.weight)
 def first_layer_sine_init(m):
     with torch.no_grad():
         if hasattr(m, "weight"):
@@ -149,6 +155,165 @@ class Moe(nn.Module):
     def forward(self, x):
         output = self.net(x)
         return output
+#noisy top-k gating
+class NoisyTopkRouter(nn.Module):
+    def __init__(self, input_size, hidden_size, num_experts,layers=2, top_k=2):
+        super(NoisyTopkRouter, self).__init__()
+        self.top_k = top_k
+
+        self.net = []
+        self.net.append(nn.Sequential(nn.Linear(input_size, hidden_size), nn.ReLU()))
+        for i in range(layers - 2):
+            self.net.append(nn.Sequential(nn.Linear(hidden_size, hidden_size), nn.ReLU()))
+        self.net.append(nn.Linear(hidden_size, num_experts))
+        self.net = nn.Sequential(*self.net)
+        self.noise_linear =nn.Linear(input_size, num_experts)
+
+        self.net.apply(kaiming_init_weights)
+        self.noise_linear.apply(kaiming_init_weights)
+    
+    def forward(self, x):
+        assert x.dim() == 2, "NoisyTopkPouter Input must have 2 dimensions: B, C"
+        logits = self.net(x)
+        noise_logits = self.noise_linear(x)
+
+        #添加噪声
+        noise = torch.randn_like(logits)*F.softplus(noise_logits)
+        noisy_logits = logits + noise
+
+        top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
+        zeros = torch.full_like(noisy_logits, float('-inf'))
+        sparse_logits = zeros.scatter(-1, indices, top_k_logits)
+        router_output = F.softmax(sparse_logits, dim=-1)
+        
+        routersum = router_output.sum(dim=0)
+        cisum = torch.bincount(indices.view(-1))
+        self.batchloss = torch.sum(cisum*routersum)* self.top_k / x.shape[0]**2
+        return router_output, indices
+
+class SparseMoE(nn.Module):
+    def __init__(self, total_param, router_ratio,
+                 router_insize, num_experts, router_layers,top_k,
+                 expert_insize, expert_layers,w0,output_act):
+        super(SparseMoE, self).__init__()
+        router_param = total_param * router_ratio
+        expert_param = (total_param - router_param)//num_experts
+        router_hidden = calc_mlp_features(router_param, router_insize, num_experts, router_layers)
+        self.router = NoisyTopkRouter(router_insize, router_hidden, num_experts, router_layers, top_k)
+        expert_hidden = calc_mlp_features(expert_param, expert_insize, False, expert_layers)
+        
+        self.experts = nn.ModuleList([SIREN(expert_insize,expert_hidden,expert_hidden,expert_layers,w0,output_act) for _ in range(num_experts)])
+        self.top_k = top_k
+        self.expert_hidden = expert_hidden
+        self.actual_param_count = get_nnmodule_param_count(self.router) + get_nnmodule_param_count(self.experts)
+
+    def forward(self, x, context):
+        assert x.dim() == 2, "SparseMoE coord Input must have 2 dimensions"
+        assert context.dim() == 2, "SparseMoE context Input must have 2 dimensions"
+        gating_output, indices = self.router(context)
+        final_output = torch.zeros((x.size(0),self.expert_hidden)).to(x.device)
+
+        # Reshape inputs for batch processing
+        flat_x = x.view(-1, x.size(-1))
+        flat_gating_output = gating_output.view(-1, gating_output.size(-1))
+
+        for i, expert in enumerate(self.experts):
+            expert_mask = (indices == i).any(dim=-1)
+            flat_mask = expert_mask.view(-1)
+
+            if flat_mask.any():
+                expert_input = flat_x[flat_mask]
+                expert_output = expert(expert_input)
+                gating_scores = flat_gating_output[flat_mask, i].unsqueeze(1)
+                weighted_output = expert_output * gating_scores
+                final_output[expert_mask] += weighted_output.squeeze(1)
+
+        return final_output
+# self-attention head
+class Head(nn.Module):
+
+    def __init__(self, input_size, head_size, context_num, dropout=0.1):
+        super().__init__()
+        self.key = nn.Linear(input_size, head_size)
+        self.query = nn.Linear(input_size, head_size)
+        self.value = nn.Linear(input_size, head_size)
+        self.register_buffer('tril', torch.tril(torch.ones(context_num, context_num)))
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B,T,C = x.shape
+        k = self.key(x)   # (B,T,C)
+        q = self.query(x) # (B,T,C)
+        # compute attention scores ("affinities")
+        wei = q @ k.transpose(-2,-1) * C**-0.5 # (B, T, C) @ (B, C, T) -> (B, T, T)
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        wei = F.softmax(wei, dim=-1) # (B, T, T)
+        wei = self.dropout(wei)
+        # perform the weighted aggregation of the values
+        v = self.value(x) # (B,T,C)
+        out = wei @ v # (B, T, T) @ (B, T, C) -> (B, T, C)
+        return out
+    
+
+    
+# Multi-Headed Self Attention
+class MultiHeadAttention(nn.Module):
+
+    def __init__(self, input_size,num_heads, head_size,context_num, feature_size,dropout=0.1):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(input_size,head_size,context_num,dropout) for _ in range(num_heads)])
+        n_embed = num_heads * head_size
+        self.proj = nn.Linear(n_embed*context_num, feature_size)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        assert x.dim() == 3, "MultiHeadAtten: Input must have 3 dimensions: B, T, C"
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = out.view(out.size(0), -1)
+        out = self.dropout(self.proj(out))
+        assert out.dim() == 2, "MultiHeadAtten: Output must have 2 dimensions: B*C, F"
+        return out
+    
+class AttentionMoe(nn.Module):
+    def __init__(self, coord_size,total_param,router_ratio,output_size,
+                 context_dim, num_heads, head_size, context_num, attention_feauture,dropout,
+                 top_k, num_experts, router_layers,
+                 expert_layers, w0, output_act):
+        
+        super(AttentionMoe, self).__init__()
+        
+        self.attention = MultiHeadAttention(context_dim,num_heads,head_size,context_num,attention_feauture,dropout)
+        
+        assert top_k <= num_experts, "top_k should be less than or equal to num_experts"
+        
+        self.moe = SparseMoE(total_param,router_ratio,attention_feauture,num_experts,router_layers,top_k,coord_size,expert_layers,w0,output_act)
+        self.top_k = top_k
+        expert_outsize = self.moe.expert_hidden
+        
+        self.decoder = nn.Sequential(nn.Linear(expert_outsize, expert_outsize), nn.ReLU(), nn.Linear(expert_outsize,output_size))
+        self.decoder.apply(kaiming_init_weights)
+
+    
+    def forward(self, x, context):
+        context = self.attention(context)
+        out = self.moe(x, context)
+        out = self.decoder(out)
+        return out
+    
+    def save_atttention(self, path):
+        pass
+    def save_decoder(self, path):
+        pass
+    def save_moe(self, path):
+        pass
+    def load_attention(self, path):
+        pass
+    def load_decoder(self, path):
+        pass
+    def load_moe(self, path):
+        pass
+
     
 class Moeincnet(nn.Module):
     def __init__(self, para_count, moe_ratio, num_sirens, input_size, frequencies, output_size, layersiren, layersmoe,w0,output_act):
@@ -165,23 +330,23 @@ class Moeincnet(nn.Module):
         
 
         self.sirens = nn.ModuleList([SIREN(input_size,siren_features,siren_features,layersiren,w0,output_act) for _ in range(num_sirens)])
-        self.moe = Moe(input_size, moe_features, num_sirens, layersmoe)
+        self.moe = NoisyTopkRouter(input_size, moe_features, num_sirens, layersmoe)
         self.decoder = nn.Sequential(nn.Linear(num_sirens*siren_features, siren_features), nn.ReLU(), nn.Linear(siren_features, output_size))
         self.decoder.apply(sine_init)
         
         self.actual_param_count = calc_mlp_param_count(input_size,siren_features,siren_features,layersiren)*num_sirens+calc_mlp_param_count(input_size,moe_features,num_sirens,layersmoe)
         self.all_param_count = self.actual_param_count + calc_mlp_param_count(num_sirens*siren_features,siren_features,output_size,2)
-        self.kl_loss = 0
+        self.batch_loss = 0
 
     def forward(self, x):
         # x = self.encoder(x)
         siren_outputs = [siren(x) for siren in self.sirens]
-        weights = self.moe(x)
+        weights,_= self.moe(x)
         # print(weights)
         log_weights = torch.log(weights+1e-10)
         # print(log_weights)
-        self.kl_loss = F.kl_div(log_weights, torch.ones_like(weights)/weights.shape[-1], reduction='batchmean')
         # print(self.kl_loss)
+        self.batch_loss = self.moe.batchloss
         weights = weights.repeat_interleave(siren_outputs[0].shape[-1], dim=-1)
         siren_outputs = torch.cat(siren_outputs, dim=-1)
         weight_output = weights * siren_outputs

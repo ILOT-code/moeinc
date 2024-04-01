@@ -9,6 +9,7 @@ from os.path import basename as opb
 from os.path import splitext as ops
 import argparse
 import time
+import torch.nn as nn
 from einops import rearrange
 import numpy as np
 
@@ -169,19 +170,19 @@ if __name__ == "__main__":
             )
         )
     if sampling_required:
-        sampler = RandomPointSampler3D_context(
-            coordinates, normalized_data, weight_map, n_random_training_samples,3
+        sampler = RandomPointSampler3D(
+            coordinates, normalized_data, weight_map, n_random_training_samples
         )
     else:
-        sampler = RandomPointSampler3D_context(
-            coordinates, normalized_data, weight_map, 100,3
-        )
-        coords_batch = sampler.flattened_coordinates
-        gt_batch = sampler.flattened_data
-        weight_map_batch = sampler.flattened_weight_map
-        # coords_batch = rearrange(coordinates, "d h w c-> (d h w) c")
-        # gt_batch = rearrange(normalized_data, "d h w c-> (d h w) c")
-        # weight_map_batch = rearrange(weight_map, "d h w c-> (d h w) c")
+        # sampler = RandomPointSampler3D_context(
+        #     coordinates, normalized_data, weight_map, 100,3
+        # )
+        # coords_batch = sampler.flattened_coordinates
+        # gt_batch = sampler.flattened_data
+        # weight_map_batch = sampler.flattened_weight_map
+        coords_batch = rearrange(coordinates, "d h w c-> (d h w) c")
+        gt_batch = rearrange(normalized_data, "d h w c-> (d h w) c")
+        weight_map_batch = rearrange(weight_map, "d h w c-> (d h w) c")
     if sampling_required:
         print(f"Use mini-batch training with batch-size={n_random_training_samples}")
     else:
@@ -202,11 +203,11 @@ if __name__ == "__main__":
         loss_d = l2_loss(predicted_batch, gt_batch, weight_map_batch)
 
         loss_d_detach = loss_d.detach()
-        loss_r_detach = network.kl_loss.detach()
+        loss_r_detach = network.batch_loss.detach()
         labmda = torch.tensor(2, device="cuda")
-        if loss_r_detach * labmda > 0.25* loss_d_detach:
-            labmda = 0.25*loss_d_detach / loss_r_detach
-        loss_r = labmda * network.kl_loss
+        if loss_r_detach * labmda > loss_d_detach:
+            labmda = loss_d_detach / loss_r_detach
+        loss_r = labmda * network.batch_loss
         loss = loss_d + loss_r
         loss.backward()
         optimizer.step()
@@ -291,7 +292,7 @@ if __name__ == "__main__":
             # results["actual_ratio"] = os.path.getsize(data_path) / get_folder_size(
             #     network_parameters_save_dir
             # )
-            results["actual_ratio"] = os.path.getsize(data_path)/network.actual_param_count
+            results["actual_ratio"] = os.path.getsize(data_path)/(network.actual_param_count*4)
             results["psnr"] = psnr
             results["ssim"] = ssim
             results["compression_time_seconds"] = compression_time_seconds
