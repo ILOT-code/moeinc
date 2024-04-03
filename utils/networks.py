@@ -98,8 +98,17 @@ class SIREN(nn.Module):
         # print(self.net)
 
     def forward(self, coords):
-        output = self.net(coords)
-        return output
+        # # 引入残差连接
+        # for i, layer in enumerate(self.net):
+        #     if i==0:
+        #         output = layer(coords)
+        #         outputbackup = output
+        #     elif i==len(self.net)-1:
+        #         output = layer(output + outputbackup) 
+        #     else:
+        #         output = layer(output)
+
+        return self.net(coords)
 
 
 class PosEncodingNeRF(nn.Module):
@@ -175,11 +184,11 @@ class NoisyTopkRouter(nn.Module):
     def forward(self, x):
         assert x.dim() == 2, "NoisyTopkPouter Input must have 2 dimensions: B, C"
         logits = self.net(x)
-        noise_logits = self.noise_linear(x)
-
+        # noise_logits = self.noise_linear(x)
+        noisy_logits = logits
         #添加噪声
-        noise = torch.randn_like(logits)*F.softplus(noise_logits)
-        noisy_logits = logits + noise
+        # noise = torch.randn_like(logits)*F.softplus(noise_logits)
+        # noisy_logits = logits + noise
 
         top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
         zeros = torch.full_like(noisy_logits, float('-inf'))
@@ -188,6 +197,9 @@ class NoisyTopkRouter(nn.Module):
         
         routersum = router_output.sum(dim=0)
         cisum = torch.bincount(indices.view(-1))
+
+        if len(cisum) < len(routersum):
+            cisum = F.pad(cisum, (0, len(routersum) - len(cisum)), value=0)
         self.batchloss = torch.sum(cisum*routersum)* self.top_k / x.shape[0]**2
         return router_output, indices
 
@@ -201,15 +213,19 @@ class SparseMoE(nn.Module):
         router_hidden = calc_mlp_features(router_param, router_insize, num_experts, router_layers)
         self.router = NoisyTopkRouter(router_insize, router_hidden, num_experts, router_layers, top_k)
         expert_hidden = calc_mlp_features(expert_param, expert_insize, False, expert_layers)
-        
+        self.decoder = nn.Sequential(nn.Linear(expert_hidden, expert_hidden), nn.ReLU(), nn.Linear(expert_hidden, 1))
         self.experts = nn.ModuleList([SIREN(expert_insize,expert_hidden,expert_hidden,expert_layers,w0,output_act) for _ in range(num_experts)])
         self.top_k = top_k
         self.expert_hidden = expert_hidden
         self.actual_param_count = get_nnmodule_param_count(self.router) + get_nnmodule_param_count(self.experts)
 
+        print(self.router)
+        print(self.experts)
     def forward(self, x, context):
         assert x.dim() == 2, "SparseMoE coord Input must have 2 dimensions"
         assert context.dim() == 2, "SparseMoE context Input must have 2 dimensions"
+        # print(x.shape)
+        # print(context.shape)
         gating_output, indices = self.router(context)
         final_output = torch.zeros((x.size(0),self.expert_hidden)).to(x.device)
 
@@ -228,7 +244,16 @@ class SparseMoE(nn.Module):
                 weighted_output = expert_output * gating_scores
                 final_output[expert_mask] += weighted_output.squeeze(1)
 
-        return final_output
+        return self.decoder(final_output)
+    
+class conv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True):
+        super(conv1d, self).__init__()
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, dilation, groups, bias)
+        self.conv.apply(kaiming_init_weights)
+
+    def forward(self, x):
+        return self.conv(x)
 # self-attention head
 class Head(nn.Module):
 
@@ -316,37 +341,33 @@ class AttentionMoe(nn.Module):
 
     
 class Moeincnet(nn.Module):
-    def __init__(self, para_count, moe_ratio, num_sirens, input_size, frequencies, output_size, layersiren, layersmoe,w0,output_act):
+    def __init__(self,context_dim, para_count, moe_ratio, num_sirens, input_size, output_size, layersiren, layersmoe,w0,output_act):
         super().__init__()
-        # self.pos_enc = PosEncodingNeRF(input_size, frequencies)
-        # input_size = self.pos_enc.out_channel
         moe_para_count = int(para_count * moe_ratio)
         siren_para_count = para_count - moe_para_count
-        
-        # self.encoder = nn.Sequential(nn.Linear(input_size,256),Sine(),nn.Linear(256, 30))
-        # input_size = 30
-        moe_features = calc_mlp_features(moe_para_count, input_size, num_sirens, layersmoe)
+
+        moe_features = calc_mlp_features(moe_para_count, context_dim, num_sirens, layersmoe)
         siren_features = calc_mlp_features(int(siren_para_count/num_sirens), input_size, False, layersiren)
         
 
         self.sirens = nn.ModuleList([SIREN(input_size,siren_features,siren_features,layersiren,w0,output_act) for _ in range(num_sirens)])
-        self.moe = NoisyTopkRouter(input_size, moe_features, num_sirens, layersmoe)
+        self.moe = NoisyTopkRouter(context_dim, moe_features, num_sirens, layersmoe)
         self.decoder = nn.Sequential(nn.Linear(num_sirens*siren_features, siren_features), nn.ReLU(), nn.Linear(siren_features, output_size))
         self.decoder.apply(sine_init)
         
-        self.actual_param_count = calc_mlp_param_count(input_size,siren_features,siren_features,layersiren)*num_sirens+calc_mlp_param_count(input_size,moe_features,num_sirens,layersmoe)
+        self.actual_param_count = calc_mlp_param_count(context_dim,siren_features,siren_features,layersiren)*num_sirens+calc_mlp_param_count(input_size,moe_features,num_sirens,layersmoe)
         self.all_param_count = self.actual_param_count + calc_mlp_param_count(num_sirens*siren_features,siren_features,output_size,2)
-        self.batch_loss = 0
+        self.batchloss = 0
 
-    def forward(self, x):
-        # x = self.encoder(x)
+    def forward(self, x, context):
+        # print(x.shape)
         siren_outputs = [siren(x) for siren in self.sirens]
-        weights,_= self.moe(x)
+        weights,_= self.moe(context)
         # print(weights)
         log_weights = torch.log(weights+1e-10)
         # print(log_weights)
         # print(self.kl_loss)
-        self.batch_loss = self.moe.batchloss
+        self.batchloss = self.moe.batchloss
         weights = weights.repeat_interleave(siren_outputs[0].shape[-1], dim=-1)
         siren_outputs = torch.cat(siren_outputs, dim=-1)
         weight_output = weights * siren_outputs

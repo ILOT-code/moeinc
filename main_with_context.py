@@ -40,6 +40,22 @@ from utils.networks import (
 )
 from utils.samplers import RandomPointSampler3D_context1d, RandomPointSampler3D_context
 
+def get_index_context(data,index):
+    d, h, w = 256, 256,256
+    contexts = []
+    for k in range(d):
+        for i in range(3-k):
+            for j in range(-i, 3-k-i):
+                t = k*h*w + i*w+ j
+                if t == 0:
+                    continue
+                if t <= index:
+                    context=data[index-t].cuda()
+                else:
+                    context = torch.zeros_like(data[0]).cuda()
+                contexts.append(context)
+    contexts = torch.cat(contexts, dim=-1)
+    return contexts
 
 EXPERIMENTAL_CONDITIONS = ["data_name", "data_type", "data_shape", "actual_ratio"]
 METRICS = [
@@ -240,22 +256,16 @@ if __name__ == "__main__":
             # decompress data
             with torch.no_grad():
                 flattened_coords = sampler.flattened_coordinates
-                flattened_context = sampler.contexts
                 flattened_decompressed_data = torch.zeros(
                     (n_samples, 1),
                     device="cuda",
                 )
-                n_inference_batch_size = config.n_inference_batch_size
-                n_inference_batchs = math.ceil(n_samples / n_inference_batch_size)
+                for i in range(256):
+                    for j in range(256):
+                        for k in range(256):
+                            index = i*256*256 + j*256 + k
+                            flattened_decompressed_data[index] = network(flattened_coords[index].unsqueeze(0),get_index_context(flattened_decompressed_data,index).unsqueeze(0))
                 decompression_time_start = time.time()
-                for batch_idx in range(n_inference_batchs):
-                    start_sample_idx = batch_idx * n_inference_batch_size
-                    end_sample_idx = min(
-                        (batch_idx + 1) * n_inference_batch_size, n_samples
-                    )
-                    flattened_decompressed_data[
-                        start_sample_idx:end_sample_idx
-                    ] = network(flattened_coords[start_sample_idx:end_sample_idx],flattened_context[start_sample_idx:end_sample_idx])
                 decompression_time_end = time.time()
                 decompression_time_seconds = (
                     decompression_time_end - decompression_time_start

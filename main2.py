@@ -21,24 +21,16 @@ from utils import *
 from utils.metrics import (
     calc_psnr, 
     calc_ssim, 
-    get_folder_size, 
     parse_checkpoints,
 )
 
 from utils.networks import (
-    SIREN,
-    Moeincnet,
     configure_lr_scheduler,
     AttentionMoe,
     configure_optimizer,
-    get_nnmodule_param_count,
-    calc_mlp_param_count,
-    calc_mlp_features,
     l2_loss,
-    # load_model,
-    # save_model,
 )
-from utils.samplers import RandomPointSampler3D_context1d, RandomPointSampler3D_context
+from utils.samplers import RandomPointSampler3D, RandomPointSampler3D_context
 
 
 EXPERIMENTAL_CONDITIONS = ["data_name", "data_type", "data_shape", "actual_ratio"]
@@ -69,9 +61,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     config_path = os.path.abspath(args.c)
-    # Make the gpu index used by CUDA_VISIBLE_DEVICES consistent with the gpu index shown in nvidia-smi
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-    # Specify the gpu index to be used
     os.environ["CUDA_VISIBLE_DEVICES"] = args.g
     ###########################
     # 1. load config
@@ -96,9 +86,7 @@ if __name__ == "__main__":
     data = tifffile.imread(data_path)
     if len(data.shape) == 3:
         data = data[..., None]
-    assert (
-        len(data.shape) == 4
-    ), "Only DHWC data is allowed. Current data shape is {}.".format(data.shape)
+    assert ( len(data.shape) == 4 ), "Only DHWC data is allowed. Current data shape is {}.".format(data.shape)
     data_shape = ",".join([str(i) for i in data.shape])
     sideinfos.depth, sideinfos.height, sideinfos.width, _ = data.shape
     n_samples = sideinfos.depth * sideinfos.width * sideinfos.height
@@ -118,9 +106,7 @@ if __name__ == "__main__":
     weight_map = generate_weight_map(denoised_data, config.data.weight_map_rules)
     # move weight_map to device
     weight_map = torch.tensor(weight_map, dtype=torch.float, device="cuda")
-    ###########################
-    # 3. prepare network
-    # calculate network structure
+
 
     ###########################
     # 4. prepare coordinates
@@ -159,12 +145,15 @@ if __name__ == "__main__":
             )
         )
     if sampling_required:
-        sampler = RandomPointSampler3D_context1d(coordinates, normalized_data,weight_map,n_random_training_samples,3)
+        sampler = RandomPointSampler3D_context(coordinates, normalized_data,weight_map,n_random_training_samples,3)
     else:
-        sampler = RandomPointSampler3D_context1d(coordinates, normalized_data,weight_map,0,3)
+        sampler = RandomPointSampler3D_context(
+            coordinates, normalized_data, weight_map,0,3
+        )
         coords_batch = sampler.flattened_coordinates
         gt_batch = sampler.flattened_data
         weight_map_batch = sampler.flattened_weight_map
+        context_batch = sampler.contexts
         # coords_batch = rearrange(coordinates, "d h w c-> (d h w) c")
         # gt_batch = rearrange(normalized_data, "d h w c-> (d h w) c")
         # weight_map_batch = rearrange(weight_map, "d h w c-> (d h w) c")
@@ -173,12 +162,17 @@ if __name__ == "__main__":
     else:
         print(f"Use batch training with batch-size={n_samples}")
     
+    context_dim = sampler.context_dim
+    context_num = sampler.context_num
     ideal_network_size_bytes = os.path.getsize(data_path) / config.compression_ratio
     ideal_network_parameters_count = ideal_network_size_bytes / 4.0
 
-    network = Moeincnet(sampler.context_dim,ideal_network_parameters_count,**config.network_structure)
-    actual_network_size_bytes = network.actual_param_count * 4.0
-    print(network)
+    network = AttentionMoe(config.network_structure.input_size,ideal_network_parameters_count,
+                           config.network_structure.moe_ratio,config.network_structure.output_size,
+                           context_dim,4,8,context_num,20,0.1,2,
+                           config.network_structure.num_sirens,config.network_structure.layersmoe,config.network_structure.layersiren,30,False)
+    actual_network_size_bytes = network.moe.actual_param_count * 4.0
+
     # 5. prepare optimizer lr_scheduler
     optimizer = configure_optimizer(network.parameters(), config.optimizer)
     lr_scheduler = configure_lr_scheduler(optimizer, config.lr_scheduler)
@@ -203,11 +197,11 @@ if __name__ == "__main__":
         loss_d = l2_loss(predicted_batch, gt_batch, weight_map_batch)
 
         loss_d_detach = loss_d.detach()
-        loss_r_detach = network.batchloss.detach()
+        loss_r_detach = network.moe.router.batchloss.detach()
         labmda = torch.tensor(2, device="cuda")
         if loss_r_detach * labmda > loss_d_detach:
             labmda = loss_d_detach / loss_r_detach
-        loss_r = labmda * network.batchloss
+        loss_r = labmda * network.moe.router.batchloss
         loss = loss_d + loss_r
         loss.backward()
         optimizer.step()
@@ -293,7 +287,7 @@ if __name__ == "__main__":
             # results["actual_ratio"] = os.path.getsize(data_path) / get_folder_size(
             #     network_parameters_save_dir
             # )
-            results["actual_ratio"] = os.path.getsize(data_path)/(network.actual_param_count*4)
+            results["actual_ratio"] = os.path.getsize(data_path)/(network.moe.actual_param_count*4)
             results["psnr"] = psnr
             results["ssim"] = ssim
             results["compression_time_seconds"] = compression_time_seconds
