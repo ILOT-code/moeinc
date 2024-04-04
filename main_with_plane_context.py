@@ -12,7 +12,7 @@ import time
 import torch.nn as nn
 from einops import rearrange
 import numpy as np
-
+import torch.nn.functional as F
 from omegaconf import OmegaConf
 import tifffile
 import torch
@@ -38,7 +38,7 @@ from utils.networks import (
     # load_model,
     # save_model,
 )
-from utils.samplers import RandomPointSampler3D_context1d, RandomPointSampler3D_context
+from utils.samplers import RandomPointSampler3D_context1d, RandomPointSampler3d_plane
 
 def get_index_context(data,index):
     d, h, w = 256, 256,256
@@ -81,7 +81,7 @@ if __name__ == "__main__":
         default=opj(opd(__file__), "config", "test.yaml"),
         help="yaml file path",
     )
-    parser.add_argument("-g", type=str, default="0", help="gpu index")
+    parser.add_argument("-g", type=str, default="2", help="gpu index")
     args = parser.parse_args()
 
     config_path = os.path.abspath(args.c)
@@ -175,9 +175,9 @@ if __name__ == "__main__":
             )
         )
     if sampling_required:
-        sampler = RandomPointSampler3D_context1d(coordinates, normalized_data,weight_map,n_random_training_samples,3)
+        sampler = RandomPointSampler3d_plane(coordinates, normalized_data,weight_map,n_random_training_samples,2)
     else:
-        sampler = RandomPointSampler3D_context1d(coordinates, normalized_data,weight_map,0,3)
+        sampler = RandomPointSampler3d_plane(coordinates, normalized_data,weight_map,0,2)
         coords_batch = sampler.flattened_coordinates
         gt_batch = sampler.flattened_data
         weight_map_batch = sampler.flattened_weight_map
@@ -198,7 +198,7 @@ if __name__ == "__main__":
     # 5. prepare optimizer lr_scheduler
     optimizer = configure_optimizer(network.parameters(), config.optimizer)
     lr_scheduler = configure_lr_scheduler(optimizer, config.lr_scheduler)
-    # (optional) load pretrained network
+    # (optional) load pretrainedkf network
     # if config.pretrained_network_path is not None:
     #     load_model(network, config.pretrained_network_path, "cuda")
     # move network to device
@@ -218,11 +218,11 @@ if __name__ == "__main__":
         predicted_batch = network(coords_batch,context_batch)
         loss_d = l2_loss(predicted_batch, gt_batch, weight_map_batch)
 
-        loss_d_detach = loss_d.detach()
-        loss_r_detach = network.batchloss.detach()
+        # loss_d_detach = loss_d.detach()
+        # loss_r_detach = network.batchloss.detach()
         labmda = torch.tensor(2, device="cuda")
-        if loss_r_detach * labmda > loss_d_detach:
-            labmda = loss_d_detach / loss_r_detach
+        # if loss_r_detach * labmda > loss_d_detach:
+        #     labmda = loss_d_detach / loss_r_detach
         loss_r = labmda * network.batchloss
         loss = loss_d + loss_r
         loss.backward()
@@ -260,11 +260,28 @@ if __name__ == "__main__":
                     (n_samples, 1),
                     device="cuda",
                 )
-                for i in range(256):
-                    for j in range(256):
-                        for k in range(256):
-                            index = i*256*256 + j*256 + k
-                            flattened_decompressed_data[index] = network(flattened_coords[index].unsqueeze(0),get_index_context(flattened_decompressed_data,index).unsqueeze(0))
+                plane_pix = 256*256
+                for d in range(256):
+                    start_index = d*plane_pix
+                    end_index = (d+1)*plane_pix
+                    input_coords = flattened_coords[start_index:end_index]
+                    prepare_context = torch.zeros((2*plane_pix,1),device="cuda")
+                    if d >= 2:
+                        prepare_context[0:plane_pix] = flattened_decompressed_data[start_index-2*plane_pix:start_index-plane_pix]
+                    if d >= 1:
+                        prepare_context[plane_pix:] = flattened_decompressed_data[start_index-plane_pix:start_index]
+                    prepare_context = prepare_context.reshape(2,256,256)
+                    prepare_context = F.pad(prepare_context, (1,1,1,1,0,1), mode='constant', value=0)
+                    ds,de,hs,he,ws,we = 2,3,1,257,1,257
+                    input_context = []
+                    for i in range(1,3):
+                        for j in range(-1,2):
+                            for k in range(-1,2):
+                                input_context.append(prepare_context[ds-i:de-i, hs-j:he-j, ws-k:we-k])
+                            
+                    input_context = torch.stack(input_context, dim=-1).reshape(-1, sampler.context_dim)
+                    
+                    flattened_decompressed_data[start_index:end_index] = network(input_coords,input_context)         
                 decompression_time_start = time.time()
                 decompression_time_end = time.time()
                 decompression_time_seconds = (
@@ -286,7 +303,7 @@ if __name__ == "__main__":
                 decompressed_data_save_dir,
                 data_name + "_decompressed" + data_extension,
             )
-            tifffile.imwrite(decompressed_data_save_path, decompressed_data)
+            # tifffile.imwrite(decompressed_data_save_path, decompressed_data)
             # calculate metrics
             psnr = calc_psnr(data[..., 0], decompressed_data[..., 0])
             ssim = calc_ssim(data[..., 0], decompressed_data[..., 0])

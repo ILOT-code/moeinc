@@ -184,12 +184,13 @@ class NoisyTopkRouter(nn.Module):
     def forward(self, x):
         assert x.dim() == 2, "NoisyTopkPouter Input must have 2 dimensions: B, C"
         logits = self.net(x)
-        # noise_logits = self.noise_linear(x)
-        noisy_logits = logits
-        #添加噪声
-        # noise = torch.randn_like(logits)*F.softplus(noise_logits)
-        # noisy_logits = logits + noise
-
+        if self.training:
+            noise_logits = self.noise_linear(x)
+            #添加噪声
+            noise = torch.randn_like(logits)*F.softplus(noise_logits)
+            noisy_logits = logits + noise
+        else:
+            noisy_logits = logits
         top_k_logits, indices = noisy_logits.topk(self.top_k, dim=-1)
         zeros = torch.full_like(noisy_logits, float('-inf'))
         sparse_logits = zeros.scatter(-1, indices, top_k_logits)
@@ -355,7 +356,7 @@ class Moeincnet(nn.Module):
         self.decoder = nn.Sequential(nn.Linear(num_sirens*siren_features, siren_features), nn.ReLU(), nn.Linear(siren_features, output_size))
         self.decoder.apply(sine_init)
         
-        self.actual_param_count = calc_mlp_param_count(context_dim,siren_features,siren_features,layersiren)*num_sirens+calc_mlp_param_count(input_size,moe_features,num_sirens,layersmoe)
+        self.actual_param_count = get_nnmodule_param_count(self.moe) + get_nnmodule_param_count(self.sirens)
         self.all_param_count = self.actual_param_count + calc_mlp_param_count(num_sirens*siren_features,siren_features,output_size,2)
         self.batchloss = 0
 
