@@ -15,7 +15,7 @@ data:
   normalized_min: 0
   normalized_max: 100
   weight_map_rules: ~
-compression_ratio: 1000
+compression_ratio: 500
 network_structure:
   moe_ratio: 0.3
   num_sirens: 4

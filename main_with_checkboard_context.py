@@ -4,6 +4,7 @@ from datetime import datetime
 import math
 from tqdm import tqdm
 import os
+import nibabel as nib
 from os.path import join as opj
 from os.path import dirname as opd
 from os.path import basename as opb
@@ -30,7 +31,6 @@ from utils.networks import (
     SIREN,
     Moeincnet,
     configure_lr_scheduler,
-    AttentionMoe,
     configure_optimizer,
     get_nnmodule_param_count,
     calc_mlp_param_count,
@@ -58,7 +58,6 @@ timestamp = datetime.now().strftime("_%Y%m%d_%H%M%S.%f")[:-3]
 
 
 if __name__ == "__main__":
-    print(torch.cuda.is_available())
     parser = argparse.ArgumentParser(description="single task for Moeinc mdeical picture compression")
     parser.add_argument(
         "-c",
@@ -66,7 +65,7 @@ if __name__ == "__main__":
         default=opj(opd(__file__), "config", "test.yaml"),
         help="yaml file path",
     )
-    parser.add_argument("-g", type=str, default="2", help="gpu index")
+    parser.add_argument("-g", type=str, default="0,1", help="gpu index")
     args = parser.parse_args()
 
     config_path = os.path.abspath(args.c)
@@ -74,6 +73,7 @@ if __name__ == "__main__":
     os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
     # Specify the gpu index to be used
     os.environ["CUDA_VISIBLE_DEVICES"] = args.g
+    print(torch.cuda.is_available())
     ###########################
     # 1. load config
     config = OmegaConf.load(config_path)
@@ -95,6 +95,9 @@ if __name__ == "__main__":
     data_extension = ops(opb(data_path))[-1]
     # read original data
     data = tifffile.imread(data_path)
+    # niiimage = nib.load(data_path)
+    # data = np.array(niiimage.dataobj).squeeze()
+    # print(f"Data shape:{data.shape}")
     if len(data.shape) == 3:
         data = data[..., None]
     assert (
@@ -113,6 +116,7 @@ if __name__ == "__main__":
     sideinfos.normalized_min = config.data.normalized_min
     sideinfos.normalized_max = config.data.normalized_max
     normalized_data = normalize(denoised_data, sideinfos)
+    print(f"Memory allocated:{torch.cuda.memory_allocated()/1024/1024}MB")
     # move data to device
     normalized_data = torch.tensor(normalized_data, dtype=torch.float, device="cuda")
     # generate weight_map
@@ -141,6 +145,7 @@ if __name__ == "__main__":
     )
     coordinates = coordinates.cuda()
     ###########################
+    print(f"Memory allocated:{torch.cuda.memory_allocated()/1024/1024}MB")
 
     ###########################
     # 6. prepare sampler
@@ -176,6 +181,7 @@ if __name__ == "__main__":
     
     ideal_network_size_bytes = os.path.getsize(data_path) / config.compression_ratio
     ideal_network_parameters_count = ideal_network_size_bytes / 4.0
+    print(f"ideal_network_parameters_count:{ideal_network_parameters_count}")
 
     network = Moeincnet(sampler.context_dim,ideal_network_parameters_count,**config.network_structure)
     actual_network_size_bytes = network.actual_param_count * 4.0
@@ -188,6 +194,8 @@ if __name__ == "__main__":
     #     load_model(network, config.pretrained_network_path, "cuda")
     # move network to device
     network.cuda()
+    # 打印显存占用情况
+    print(f"Memory allocated:{torch.cuda.memory_allocated()/1024/1024}MB")
     ###########################
     # 7. optimizing
     checkpoints = parse_checkpoints(config.checkpoints, n_training_steps)
@@ -200,9 +208,11 @@ if __name__ == "__main__":
         if sampling_required:
             coords_batch, gt_batch, weight_map_batch,context_batch = sampler.next()
         optimizer.zero_grad()
+        # print(torch.cuda.memory_allocated()/1024/1024)
         predicted_batch = network(coords_batch,context_batch)
+        # print(torch.cuda.memory_allocated()/1024/1024)
+        
         loss_d = l2_loss(predicted_batch, gt_batch, weight_map_batch)
-
         # loss_d_detach = loss_d.detach()
         # loss_r_detach = network.batchloss.detach()
         labmda = torch.tensor(2, device="cuda")
@@ -214,6 +224,7 @@ if __name__ == "__main__":
         optimizer.step()
         lr_scheduler.step()
         if steps % n_print_loss_interval == 0:
+            print(f"Memory allocated:{torch.cuda.memory_allocated()/1024/1024}MB")
             compression_time_end = time.time()
             compression_time_seconds += compression_time_end - compression_time_start
             # pbar.set_postfix_str("loss={:.6f}".format(loss.item()))
@@ -248,6 +259,8 @@ if __name__ == "__main__":
                 dn, hn,wn =2,2,2
                 nd, nh, nw = d//dn, h//hn, w//wn
                 network.eval()
+                decompression_time_start = time.time()
+                
                 for k in range(0,dn):
                     for i in range(0,hn):
                         for j in range(0,wn):
@@ -268,7 +281,6 @@ if __name__ == "__main__":
                                 inf_sampler.set_data(inf_data1,1)
 
                             decompressed_data[k*nd:(k+1)*nd, i*nh:(i+1)*nh, j*nw:(j+1)*nw] = inf_sampler.data
-                decompression_time_start = time.time()
                 decompression_time_end = time.time()
                 decompression_time_seconds = (
                     decompression_time_end - decompression_time_start
